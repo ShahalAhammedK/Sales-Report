@@ -65,13 +65,13 @@ if col1.button("Extract Data"):
         st.warning("Please paste a report")
     else:
 
-        reports = input_text.split("vivo V70 Sales Reporting")
+        reports = input_text.split("vivo V70 FE")
 
         extracted = []
 
         for r in reports:
             if r.strip():
-                r = "vivo V70 Sales Reporting" + r
+                r = "vivo V70 FE" + r
                 extracted.append(extract_data(r))
 
         df = pd.DataFrame(extracted)
