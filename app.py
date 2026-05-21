@@ -63,17 +63,25 @@ def extract_data(text):
         else:
             data["Number"] = ""
 
-    # Sales Type — first try the labelled value, then fall back to the header line.
-    # Headers like "vivo X300 Ultra prebooking" or "PRE ORDER" tell us the type.
+    # Sales Type — first try the labelled value, then fall back to scanning the
+    # WHOLE message for cues. Strong cues: "prebooking" / "pre-booking" header,
+    # "Which option prebooked:" label (only pre-booking reports use this),
+    # "PRE ORDER" / "Direct Sale" mentions, etc.
     st_val = data["Sales Type"].lower()
     if not st_val:
-        # Scan the first ~5 lines for a header-style cue
-        header_zone = "\n".join(text.splitlines()[:5]).lower()
-        if re.search(r"pre[\s\-]?booking", header_zone):
-            st_val = "pre-booking collection" if "collect" in header_zone else "pre-booking"
-        elif re.search(r"pre[\s\-]?order", header_zone):
-            st_val = "pre-order collection" if "collect" in header_zone else "pre-order"
-        elif re.search(r"direct", header_zone):
+        text_lower = text.lower()
+        # "Which option prebooked" is a 100% pre-booking signal
+        if re.search(r"which\s*option\s*prebook", text_lower):
+            st_val = "pre-booking"
+        elif re.search(r"pre[\s\-]?booking\s*collection", text_lower):
+            st_val = "pre-booking collection"
+        elif re.search(r"pre[\s\-]?booking", text_lower):
+            st_val = "pre-booking"
+        elif re.search(r"pre[\s\-]?order\s*collection", text_lower):
+            st_val = "pre-order collection"
+        elif re.search(r"pre[\s\-]?order", text_lower):
+            st_val = "pre-order"
+        elif re.search(r"direct\s*sale", text_lower):
             st_val = "direct sale"
 
     if "pre" in st_val and ("book" in st_val or "order" in st_val):
