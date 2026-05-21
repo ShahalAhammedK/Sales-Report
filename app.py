@@ -14,47 +14,76 @@ def extract_data(text):
     data = {}
 
     # Patterns — each handles ":" or ":-" separator and ignores leading dashes
-    # in values like "Sales Type:- Direct"
+    # in values like "Sales Type:- Direct".
+    # Note: we use [ \t\-]* (not [-\s]*) after the colon so the separator
+    # cannot greedily consume a newline if the value is empty (e.g. "Number:- --").
     patterns = {
-        "Sales Type":          r"Sales\s*Type\s*:[-\s]*(.*)",
-        "Date":                r"Date\s*:[-\s]*(.*)",
-        "VBA Name":            r"VBA\s*Name\s*:[-\s]*(.*)",
-        "Store":               r"Store(?:\s*Name)?\s*:[-\s]*(.*)",
-        "Customer Name":       r"Customer\s*Name\s*:[-\s]*(.*)",
-        "Color":               r"Colou?r\s*:[-\s]*(.*)",
-        "Which Option":        r"(?:Which\s*option|Option|Storage\s*Variant|Variant|Package)\s*:[-\s]*(.*)",
-        "Nationality":         r"(?:Customer\s*)?Nationality\s*:[-\s]*(.*)",
-        "Occupation":          r"(?:Customer\s*)?Occupation\s*:[-\s]*(.*)",
-        "Previous Model Used": r"Previous\s*(?:which\s*)?model\s*Use(?:u)?d\s*:[-\s]*(.*)",
-        "Where did you hear":  r"Where\s*did\s*you\s*hear[^:]*:[-\s]*(.*)",
+        "Sales Type":          r"Sales\s*Type\s*:[ \t\-]*([^\n]*)",
+        "Date":                r"Date\s*:[ \t\-]*([^\n]*)",
+        "VBA Name":            r"VBA\s*Name\s*:[ \t\-]*([^\n]*)",
+        "Store":               r"Store(?:\s*Name)?\s*:[ \t\-]*([^\n]*)",
+        "Customer Name":       r"(?:Customer|Coustmer)\s*Name\s*:[ \t\-]*([^\n]*)",
+        "Color":               r"Colou?r\s*:[ \t\-]*([^\n]*)",
+        "Which Option":        r"(?:Which\s*option(?:\s*\w+)?|Option|Storage\s*Variant|Variant|Package)\s*:[ \t\-]*([^\n]*)",
+        "Nationality":         r"(?:Customer\s*)?Nationality\s*:[ \t\-]*([^\n]*)",
+        "Occupation":          r"(?:Customer\s*)?Occupation\s*:[ \t\-]*([^\n]*)",
+        "Previous Model Used": r"Previous\s*(?:which\s*)?model\s*Use(?:u)?d\s*:[ \t\-]*([^\n]*)",
+        "Where did you hear":  r"Where\s*did\s*you\s*hear[^:\n]*:[ \t\-]*([^\n]*)",
     }
 
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
         value = match.group(1).strip() if match else ""
-        # Stop at newline (keep only first line of the value)
-        value = value.split("\n")[0].strip()
-        # Remove trailing stars / dashes / colons left over
         value = re.sub(r"[\-:\s]+$", "", value).strip()
+        # If the value is just dashes/punctuation (e.g. "--", "-", "—"), treat as empty
+        if re.fullmatch(r"[\-\u2013\u2014\s\.]*", value):
+            value = ""
         data[key] = value
 
-    # UAE phone extraction (works even if "Number:" label is missing)
+    # UAE phone extraction (works even if "Number:" label is missing or "--")
     phone_pattern = r'(\+?9715\d[\s\-]?\d{3}[\s\-]?\d{4}|0?5\d[\s\-]?\d{3}[\s\-]?\d{4})'
     phone = re.search(phone_pattern, text)
     if phone:
-        # Clean spaces/dashes in the number
         data["Number"] = re.sub(r"[\s\-]", "", phone.group(0))
     else:
-        # Fallback: try generic "Number:" / "Contact Number:" label
-        m = re.search(r"(?:Customer\s*)?(?:Contact\s*)?Number\s*:[-\s]*([^\n]+)", text, re.IGNORECASE)
-        data["Number"] = m.group(1).strip() if m else ""
+        # Fallback: "Number:" / "Customer Number:" / "Contact Number:" label.
+        # Use [ \t\-]* (not [-\s]*) so we don't accidentally consume the newline
+        # when the value is just "--" or empty.
+        m = re.search(
+            r"(?:Customer\s*|Contact\s*)?Number\s*:[ \t\-]*([^\n]*)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            val = m.group(1).strip()
+            val = re.sub(r"[\-:\s]+$", "", val).strip()
+            # Treat dashes-only ("--", "—") as empty
+            if re.fullmatch(r"[\-\u2013\u2014\s\.]*", val):
+                val = ""
+            data["Number"] = val
+        else:
+            data["Number"] = ""
 
-    # Normalize Sales Type
+    # Sales Type — first try the labelled value, then fall back to the header line.
+    # Headers like "vivo X300 Ultra prebooking" or "PRE ORDER" tell us the type.
     st_val = data["Sales Type"].lower()
+    if not st_val:
+        # Scan the first ~5 lines for a header-style cue
+        header_zone = "\n".join(text.splitlines()[:5]).lower()
+        if re.search(r"pre[\s\-]?booking", header_zone):
+            st_val = "pre-booking collection" if "collect" in header_zone else "pre-booking"
+        elif re.search(r"pre[\s\-]?order", header_zone):
+            st_val = "pre-order collection" if "collect" in header_zone else "pre-order"
+        elif re.search(r"direct", header_zone):
+            st_val = "direct sale"
+
     if "pre" in st_val and ("book" in st_val or "order" in st_val):
         data["Sales Type"] = "Pre-booking Collection" if "collect" in st_val else "Pre-booking"
     elif "direct" in st_val:
         data["Sales Type"] = "Direct Sale"
+
+    # Date normalization — "12.06.2026" → "12/06/2026", "12-06-2026" → "12/06/2026"
+    if data["Date"]:
+        data["Date"] = re.sub(r"[\.\-]", "/", data["Date"]).strip()
 
     return data
 
@@ -62,9 +91,12 @@ def extract_data(text):
 # ---------- Split into multiple reports ----------
 def split_reports(text):
     """Split pasted text into individual X300 Ultra reports."""
-    # Strategy 1: split on the report header
+    # Strategy 1: split on any X300 report header
+    # Matches: "vivo X300 Ultra reporting format", "vivo X300 Ultra prebooking",
+    # "X300 Pro Sales Reporting", "vivo X300 Ultra Pre-booking", etc.
     header_re = re.compile(
-        r"(?=^\s*\*?\s*(?:vivo\s+)?x300\s*(?:ultra|pro)?.*reporting.*\*?\s*$)",
+        r"(?=^\s*\*?\s*(?:vivo\s+)?x300\s*(?:ultra|pro|fe)?\s*"
+        r"(?:reporting|pre[\s\-]?booking|pre[\s\-]?order|sales)\b.*$)",
         re.IGNORECASE | re.MULTILINE,
     )
     parts = header_re.split(text)
@@ -82,6 +114,21 @@ def split_reports(text):
         for i, start in enumerate(sales_type_positions):
             end = sales_type_positions[i + 1] if i + 1 < len(sales_type_positions) else len(text)
             chunks.append(text[start:end].strip())
+        return chunks
+
+    # Strategy 3: split on repeated "Date:" lines (for reports without Sales Type label)
+    date_positions = [
+        m.start() for m in re.finditer(r"^\s*\*?\s*Date\s*:",
+                                       text, re.IGNORECASE | re.MULTILINE)
+    ]
+    if len(date_positions) >= 2:
+        chunks = []
+        for i, start in enumerate(date_positions):
+            end = date_positions[i + 1] if i + 1 < len(date_positions) else len(text)
+            # Include the line before (might be the header)
+            line_start = text.rfind("\n", 0, start) + 1
+            prev_line_start = text.rfind("\n", 0, line_start - 1) + 1
+            chunks.append(text[prev_line_start:end].strip())
         return chunks
 
     # Single report
@@ -122,20 +169,19 @@ input_text = st.text_area(
     "Sales Reports",
     height=320,
     placeholder=(
-        "vivo X300 Ultra reporting format\n"
+        "vivo X300 Ultra prebooking\n"
         "———————————————\n"
-        "Sales Type:- Direct\n"
-        "Date:- 21/05/2026\n"
-        "VBA Name:- Arif\n"
-        "Store:- SDG DCC\n"
-        "Customer Name:- Dixon\n"
-        "Number:- 0521668689\n"
-        "Color:- Black\n"
-        "Which option:- Full kit\n"
-        "Nationality:- Lebanon\n"
+        "Date:- 12.06.2026\n"
+        "VBA Name:- Mohammed sahil\n"
+        "Store:- Vivo Al tamam store\n"
+        "Customer Name:- Nishad yusuf\n"
+        "Customer Number:- 0501234567\n"
+        "Color:- black\n"
+        "Which option prebooked:- only phone\n"
+        "Nationality:- Indian\n"
         "Occupation:- Business\n"
-        "Previous which model Used:- S23 Ultra\n"
-        "Where did you hear about the X300?:- In Store"
+        "Previous which model Used:- S26 ULTRA\n"
+        "Where did you hear about the X300?: Social media"
     ),
 )
 
