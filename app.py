@@ -21,6 +21,7 @@ DEFAULT_FILE_NAME = "sales_reports.xlsx"
 FIELD_PATTERNS = {
     "Sales Type":          r"Sales\s*Type\s*:[ \t\-]*([^\n]*)",
     "Date":                r"Date\s*:[ \t\-]*([^\n]*)",
+    "Model Name":          r"Model\s*Name\s*:[ \t\-]*([^\n]*)",
     "VBA Name":            r"VBA\s*Name\s*:[ \t\-]*([^\n]*)",
     "Store":               r"Store(?:\s*Name)?\s*:[ \t\-]*([^\n]*)",
     "Customer Name":       r"(?:Customer|Coustmer)\s*Name\s*:[ \t\-]*([^\n]*)",
@@ -64,11 +65,11 @@ def clean_value(value: str) -> str:
 # it (that isn't blank/a separator/a sender name) is treated as the device
 # title — whatever it says (X300 Pro, X300 Ultra, V70 FE, or any future name).
 FIELD_LABEL_RE = re.compile(
-    r"^\s*\*?\s*(Sales\s*Type|Date|VBA\s*Name|Store(?:\s*Name)?|"
+    r"^\s*\*?\s*(Sales\s*Type|Date|Model\s*Name|VBA\s*Name|Store(?:\s*Name)?|"
     r"(?:Customer|Coustmer)\s*Name|Colou?r|Which\s*option|Option|"
     r"Storage\s*Variant|Variant|Package|(?:Customer\s*)?National(?:ity)?|"
     r"(?:Customer\s*)?Occupation|Previous|Where\s*did\s*you\s*hear|"
-    r"(?:Customer\s*|Contact\s*|Mobile\s*)?Number)[^\n:]*:",
+    r"(?:Customer\s*|Contact\s*|Mobile\s*)?(?:Number|Nember|Nembr))[^\n:]*:",
     re.IGNORECASE,
 )
 
@@ -78,10 +79,23 @@ FIELD_LABEL_RE = re.compile(
 # Strip that off so the sender's own phone number never gets mistaken for
 # the customer's number, and so it doesn't pollute the device title.
 WHATSAPP_PREFIX_RE = re.compile(r"^\s*\[[^\]\n]*\]\s*[^\n:]*:\s*")
+ENVELOPE_DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}")
 
 
 def strip_whatsapp_prefix(text: str) -> str:
     return WHATSAPP_PREFIX_RE.sub("", text, count=1)
+
+
+def extract_envelope_date(text: str) -> str:
+    """If the WhatsApp timestamp bracket includes a full date with year
+    (e.g. '[9:55 pm, 29/06/2026]'), use it as a fallback when the report
+    body itself has no 'Date:' field. Brackets with only day/month and no
+    year (e.g. '[08/05, 5:42 pm]') are skipped — too ambiguous to guess."""
+    m = re.match(r"^\s*\[([^\]\n]*)\]", text)
+    if not m:
+        return ""
+    date_match = ENVELOPE_DATE_RE.search(m.group(1))
+    return date_match.group(0) if date_match else ""
 
 
 def extract_device(text: str) -> str:
@@ -148,6 +162,7 @@ def normalize_date(value: str) -> str:
 
 # ---------- Extract Data from one report block ----------
 def extract_data(text: str) -> dict:
+    envelope_date = extract_envelope_date(text)
     text = text.replace("*", "")
     text = strip_whatsapp_prefix(text)
     text = re.sub(r"^\s*[—\-=_]{3,}\s*$", "", text, flags=re.MULTILINE)
@@ -157,6 +172,11 @@ def extract_data(text: str) -> dict:
     for key, pattern in FIELD_PATTERNS.items():
         match = re.search(pattern, text, re.IGNORECASE)
         data[key] = clean_value(match.group(1)) if match else ""
+
+    # A "Model Name:" field (when present) is a more reliable device label
+    # than a guessed title line like "Direct Sale".
+    if data.get("Model Name"):
+        data["Device"] = data["Model Name"]
 
     # Sales Type — fall back to scanning the whole message for cues if no label found
     if not data["Sales Type"]:
@@ -175,7 +195,7 @@ def extract_data(text: str) -> dict:
             data["Sales Type"] = "direct sale"
     data["Sales Type"] = normalize_sales_type(data["Sales Type"])
 
-    data["Date"] = normalize_date(data["Date"])
+    data["Date"] = normalize_date(data["Date"]) or normalize_date(envelope_date)
     data["Number"] = extract_phone(text)
 
     return data
@@ -205,9 +225,24 @@ def _get_preceding_title(text: str, pos: int) -> str:
 def split_reports(text: str):
     """Split pasted text into individual reports, regardless of device type."""
 
-    # Strategy 1: split on repeated "Sales Type:" lines. This is the most
-    # reliable anchor since nearly every report format includes it,
-    # regardless of whether it also has a recognizable header line.
+    # Strategy 0: split on WhatsApp message envelopes, e.g.
+    # "[08/05, 5:42 pm] +91 81025 78346: ..." or
+    # "[9:55 pm, 29/06/2026] +971 56 651 5001: ...". This is the most
+    # reliable anchor for real chat exports/forwards since every message
+    # starts with one, regardless of what fields the body happens to use
+    # (some messages have no "Sales Type:" or "Date:" label at all).
+    envelope_positions = [
+        m.start() for m in re.finditer(r"^\s*\[[^\]\n]+\]\s*[^\n:]*:", text, re.MULTILINE)
+    ]
+    if len(envelope_positions) >= 2:
+        chunks = []
+        for i, start in enumerate(envelope_positions):
+            end = envelope_positions[i + 1] if i + 1 < len(envelope_positions) else len(text)
+            chunks.append(text[start:end].strip())
+        return chunks
+
+    # Strategy 1: split on repeated "Sales Type:" lines. Reliable anchor
+    # for pastes that don't include the WhatsApp envelope.
     sales_type_positions = [
         m.start() for m in re.finditer(r"^\s*\*?\s*Sales\s*Type\s*:",
                                         text, re.IGNORECASE | re.MULTILINE)
