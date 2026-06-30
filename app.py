@@ -59,22 +59,44 @@ def clean_value(value: str) -> str:
     return value
 
 
+# Matches any recognized field-label line ("Sales Type:", "Date:", "Number:",
+# etc). Used to recognize where the field section starts, so anything ABOVE
+# it (that isn't blank/a separator/a sender name) is treated as the device
+# title — whatever it says (X300 Pro, X300 Ultra, V70 FE, or any future name).
+FIELD_LABEL_RE = re.compile(
+    r"^\s*\*?\s*(Sales\s*Type|Date|VBA\s*Name|Store(?:\s*Name)?|"
+    r"(?:Customer|Coustmer)\s*Name|Colou?r|Which\s*option|Option|"
+    r"Storage\s*Variant|Variant|Package|(?:Customer\s*)?National(?:ity)?|"
+    r"(?:Customer\s*)?Occupation|Previous|Where\s*did\s*you\s*hear|"
+    r"(?:Customer\s*|Contact\s*|Mobile\s*)?Number)\s*:",
+    re.IGNORECASE,
+)
+
+
 def extract_device(text: str) -> str:
-    """Guess the device/model name from the top of a report block."""
-    lines = [l.strip(" *—-") for l in text.splitlines() if l.strip(" *—-")]
-    for line in lines[:3]:
-        if ":" in line:
+    """The device/model is whatever title is written above the field list —
+    e.g. 'X300 Pro', 'vivo X300 Ultra reporting format', 'VIVO V70FE Sales
+    Reporting', 'Vivo X300 pro'. We don't try to guess a model name from
+    digits anywhere in the text (that misfires on phone numbers / storage
+    sizes) — we just take the literal line(s) before the first field label."""
+    lines = [l.strip(" *—-") for l in text.splitlines()]
+    title_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if title_lines:
+                break
             continue
-        if re.match(r"^~", line):  # WhatsApp sender name line e.g. "~ A.b"
+        if re.match(r"^~", stripped):  # WhatsApp sender name line e.g. "~ A.b"
             continue
-        if re.fullmatch(r"[\-=_—\s]{3,}", line):
+        if re.fullmatch(r"[\-=_—\s]{3,}", stripped):
             continue
-        if re.search(r"\d", line) or re.search(r"vivo|iqoo|oppo|samsung|realme|xiaomi|honor", line, re.IGNORECASE):
-            return line
-    # fallback: search anywhere for a model-like token
-    m = re.search(r"(vivo|iqoo|oppo|samsung|realme|xiaomi|honor)?\s*[a-z]?\d{2,4}\s*(ultra|pro|fe|plus|lite|max)?",
-                  text, re.IGNORECASE)
-    return clean_value(m.group(0)) if m and clean_value(m.group(0)) else "Unknown"
+        if FIELD_LABEL_RE.match(stripped):
+            break
+        title_lines.append(stripped)
+        if len(title_lines) >= 2:
+            break
+    return " ".join(title_lines) if title_lines else "Unknown"
 
 
 def extract_phone(text: str) -> str:
