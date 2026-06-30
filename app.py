@@ -68,9 +68,20 @@ FIELD_LABEL_RE = re.compile(
     r"(?:Customer|Coustmer)\s*Name|Colou?r|Which\s*option|Option|"
     r"Storage\s*Variant|Variant|Package|(?:Customer\s*)?National(?:ity)?|"
     r"(?:Customer\s*)?Occupation|Previous|Where\s*did\s*you\s*hear|"
-    r"(?:Customer\s*|Contact\s*|Mobile\s*)?Number)\s*:",
+    r"(?:Customer\s*|Contact\s*|Mobile\s*)?Number)[^\n:]*:",
     re.IGNORECASE,
 )
+
+
+# WhatsApp exports/forwards often prefix each message with
+# "[9:55 pm, 29/06/2026] +971 56 651 5001: " before the actual report text.
+# Strip that off so the sender's own phone number never gets mistaken for
+# the customer's number, and so it doesn't pollute the device title.
+WHATSAPP_PREFIX_RE = re.compile(r"^\s*\[[^\]\n]*\]\s*[^\n:]*:\s*")
+
+
+def strip_whatsapp_prefix(text: str) -> str:
+    return WHATSAPP_PREFIX_RE.sub("", text, count=1)
 
 
 def extract_device(text: str) -> str:
@@ -138,6 +149,7 @@ def normalize_date(value: str) -> str:
 # ---------- Extract Data from one report block ----------
 def extract_data(text: str) -> dict:
     text = text.replace("*", "")
+    text = strip_whatsapp_prefix(text)
     text = re.sub(r"^\s*[—\-=_]{3,}\s*$", "", text, flags=re.MULTILINE)
 
     data = {"Device": extract_device(text)}
@@ -169,6 +181,26 @@ def extract_data(text: str) -> dict:
     return data
 
 
+def _get_preceding_title(text: str, pos: int) -> str:
+    """Walk backwards from `pos` collecting title/header lines (stopping at
+    a blank line, a previous field-label line, or after 2 lines) so each
+    split chunk keeps its own device title rather than the previous
+    report's leftover text."""
+    lines_before = text[:pos].splitlines()
+    collected = []
+    for line in reversed(lines_before):
+        stripped = line.strip()
+        if not stripped:
+            break
+        if FIELD_LABEL_RE.match(stripped):
+            break
+        collected.append(line)
+        if len(collected) >= 2:
+            break
+    collected.reverse()
+    return "\n".join(collected)
+
+
 # ---------- Split into multiple reports ----------
 def split_reports(text: str):
     """Split pasted text into individual reports, regardless of device type."""
@@ -184,11 +216,9 @@ def split_reports(text: str):
         chunks = []
         for i, start in enumerate(sales_type_positions):
             end = sales_type_positions[i + 1] if i + 1 < len(sales_type_positions) else len(text)
-            # include the line(s) above (likely the device header) back to the
-            # previous blank line, so the device name is captured
-            block_start = text.rfind("\n\n", 0, start)
-            block_start = block_start + 2 if block_start != -1 else 0
-            chunks.append(text[block_start:end].strip())
+            title = _get_preceding_title(text, start)
+            chunk = (title + "\n" if title else "") + text[start:end]
+            chunks.append(chunk.strip())
         return chunks
 
     # Strategy 2: split on generic report-header lines, e.g.
@@ -212,9 +242,9 @@ def split_reports(text: str):
         chunks = []
         for i, start in enumerate(date_positions):
             end = date_positions[i + 1] if i + 1 < len(date_positions) else len(text)
-            block_start = text.rfind("\n\n", 0, start)
-            block_start = block_start + 2 if block_start != -1 else 0
-            chunks.append(text[block_start:end].strip())
+            title = _get_preceding_title(text, start)
+            chunk = (title + "\n" if title else "") + text[start:end]
+            chunks.append(chunk.strip())
         return chunks
 
     # Strategy 4: split on blank-line-separated blocks (last resort, only if
