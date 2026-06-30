@@ -121,7 +121,9 @@ def extract_device(text: str) -> str:
         title_lines.append(stripped)
         if len(title_lines) >= 2:
             break
-    return " ".join(title_lines) if title_lines else "Unknown"
+    title = " ".join(title_lines) if title_lines else "Unknown"
+    title = re.sub(r"^\d+\s*(?:st|nd|rd|th)[.,]?\s*", "", title, flags=re.IGNORECASE).strip()
+    return title if title else "Unknown"
 
 
 def extract_phone(text: str) -> str:
@@ -201,6 +203,23 @@ def extract_data(text: str) -> dict:
     return data
 
 
+# Matches the START of an individual report within a blob of text: an
+# optional ordinal marker ("1st,", "2nd*", "3rd,") followed by either a
+# device/report header ("vivo V70 FE Sales Reporting", "X300 Ultra
+# reporting format") or a standalone "Direct Sale" title line. This is what
+# lets us split messages that bundle multiple numbered reports in one
+# WhatsApp message ("1st... 2nd... 3rd...").
+REPORT_START_RE = re.compile(
+    r"^\s*\*?\s*"
+    r"(?:\d+\s*(?:st|nd|rd|th)\b[.,]?\s*\*?\s*)?"
+    r"(?:"
+    r"(?:[A-Za-z]+\s+)?[A-Za-z]?\d{2,4}\s*\w*\s*(?:reporting\s*format|sales\s*reporting|reporting)\b"
+    r"|Direct\s*Sale\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _get_preceding_title(text: str, pos: int) -> str:
     """Walk backwards from `pos` collecting title/header lines (stopping at
     a blank line, a previous field-label line, or after 2 lines) so each
@@ -221,28 +240,12 @@ def _get_preceding_title(text: str, pos: int) -> str:
     return "\n".join(collected)
 
 
-# ---------- Split into multiple reports ----------
-def split_reports(text: str):
-    """Split pasted text into individual reports, regardless of device type."""
+def _split_by_field_anchors(text: str):
+    """Legacy fallback splitting, used when a text segment doesn't contain
+    recognizable report-title lines (REPORT_START_RE). Anchors on whichever
+    repeating field label is present: 'Sales Type:', a report header, or
+    'Date:'."""
 
-    # Strategy 0: split on WhatsApp message envelopes, e.g.
-    # "[08/05, 5:42 pm] +91 81025 78346: ..." or
-    # "[9:55 pm, 29/06/2026] +971 56 651 5001: ...". This is the most
-    # reliable anchor for real chat exports/forwards since every message
-    # starts with one, regardless of what fields the body happens to use
-    # (some messages have no "Sales Type:" or "Date:" label at all).
-    envelope_positions = [
-        m.start() for m in re.finditer(r"^\s*\[[^\]\n]+\]\s*[^\n:]*:", text, re.MULTILINE)
-    ]
-    if len(envelope_positions) >= 2:
-        chunks = []
-        for i, start in enumerate(envelope_positions):
-            end = envelope_positions[i + 1] if i + 1 < len(envelope_positions) else len(text)
-            chunks.append(text[start:end].strip())
-        return chunks
-
-    # Strategy 1: split on repeated "Sales Type:" lines. Reliable anchor
-    # for pastes that don't include the WhatsApp envelope.
     sales_type_positions = [
         m.start() for m in re.finditer(r"^\s*\*?\s*Sales\s*Type\s*:",
                                         text, re.IGNORECASE | re.MULTILINE)
@@ -256,19 +259,6 @@ def split_reports(text: str):
             chunks.append(chunk.strip())
         return chunks
 
-    # Strategy 2: split on generic report-header lines, e.g.
-    # "vivo X300 Ultra reporting format", "VIVO V70FE Sales Reporting",
-    # "X300 Pro Sales Reporting", etc.
-    header_re = re.compile(
-        r"(?=^\s*\*?\s*(?:[A-Za-z]+\s+)?[A-Za-z]?\d{2,4}\s*\w*\s*"
-        r"(?:reporting\s*format|sales\s*reporting|reporting)\b.*$)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    parts = [p.strip() for p in header_re.split(text) if p.strip()]
-    if len(parts) >= 2:
-        return parts
-
-    # Strategy 3: split on repeated "Date:" lines (reports without Sales Type)
     date_positions = [
         m.start() for m in re.finditer(r"^\s*\*?\s*Date\s*:",
                                         text, re.IGNORECASE | re.MULTILINE)
@@ -282,13 +272,69 @@ def split_reports(text: str):
             chunks.append(chunk.strip())
         return chunks
 
-    # Strategy 4: split on blank-line-separated blocks (last resort, only if
-    # there are at least 2 blocks that each contain a customer name / number)
     blocks = [b.strip() for b in re.split(r"\n\s*\n\s*\n+", text) if b.strip()]
-    if len(blocks) >= 2:
-        return blocks
+    significant_blocks = [
+        b for b in blocks
+        if re.search(r"Customer\s*Name\s*:|Sales\s*Type\s*:", b, re.IGNORECASE)
+    ]
+    if len(significant_blocks) >= 2:
+        return significant_blocks
 
     return [text.strip()] if text.strip() else []
+
+
+def _split_segment(text: str):
+    """Split a single text segment (already isolated to one WhatsApp
+    envelope, or the whole paste if no envelopes were found) into
+    individual reports."""
+    matches = [m.start() for m in REPORT_START_RE.finditer(text)]
+    if len(matches) >= 2:
+        # The first match is only "redundant" (i.e. safe to merge into the
+        # very start of the segment) when nothing but the envelope/title
+        # precedes it. If report-1's own fields already appear before this
+        # match, then it's a REAL boundary between two bundled reports
+        # (e.g. report-1's title sat on the same line as the WhatsApp
+        # envelope and so wasn't itself matchable) and must be kept.
+        first_has_fields_before = bool(
+            re.search(FIELD_LABEL_RE.pattern, text[:matches[0]], re.IGNORECASE | re.MULTILINE)
+        )
+        if first_has_fields_before:
+            bounds = [0] + matches + [len(text)]
+        else:
+            bounds = [0] + matches[1:] + [len(text)]
+        chunks = []
+        for i in range(len(bounds) - 1):
+            chunk = text[bounds[i]:bounds[i + 1]].strip()
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+    return _split_by_field_anchors(text)
+
+
+# ---------- Split into multiple reports ----------
+def split_reports(text: str):
+    """Split pasted text into individual reports, regardless of device type
+    or how many reports are bundled into a single WhatsApp message."""
+
+    # Split on WhatsApp message envelopes first, e.g.
+    # "[08/05, 5:42 pm] +91 81025 78346: ..." or
+    # "[9:55 pm, 29/06/2026] +971 56 651 5001: ...". This is the most
+    # reliable top-level anchor for real chat exports/forwards.
+    envelope_positions = [
+        m.start() for m in re.finditer(r"^\s*\[[^\]\n]+\]\s*[^\n:]*:", text, re.MULTILINE)
+    ]
+    if len(envelope_positions) >= 2:
+        segments = []
+        for i, start in enumerate(envelope_positions):
+            end = envelope_positions[i + 1] if i + 1 < len(envelope_positions) else len(text)
+            segments.append(text[start:end])
+    else:
+        segments = [text]
+
+    all_chunks = []
+    for segment in segments:
+        all_chunks.extend(_split_segment(segment))
+    return all_chunks
 
 
 # ---------- Save Excel ----------
